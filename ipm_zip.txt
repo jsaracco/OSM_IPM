@@ -1,0 +1,187 @@
+
+model{
+    
+# Priors------------------------------------------------------------------------
+
+# Method intercept for detection probability. levels 1 and 2 are methods of 
+# counting from ARU recordings. Level 3 is human point count
+for (i in 1:nmeths){
+lpct0[i] <- log(pct0[i]/(1-pct0[i]))
+pct0[i] ~ dunif(0, 1)
+}
+
+pocc ~ dunif(0, 1)
+
+tau_loc <- pow(sigma_loc, -2)
+sigma_loc ~ dunif(0, 10)
+
+a1 ~ dnorm(0, 0.01)
+b1 ~ dnorm(0, 0.01)
+
+for (i in 1:nlocs){
+pt[i] ~ dnorm(0, tau_loc)
+}
+
+for (j in 1:nlocs){
+zeta[j] ~ dbern(pocc)
+}
+for (i in 1:ncts){ 
+N[i] ~ dpois(mu_abund[i]*zeta[location[i]])
+log(mu_abund[i]) = log(ntot[YR[i]]) + b1*hab[i] + pt[loc_id[i]]
+
+  for (j in 1:nrep){
+# Count model-------------------------------------------------------------------
+    C[i, j] ~ dbin(pct[i, j], N[i])
+    logit(pct[i, j]) <- lpct0[meth[i]] + a1*dur[i]
+    # Expected count 
+    C.exp[i, j] <- pct[i, j] * N[i]
+    # Data discrepancy 
+    chi2.act[i,j] <- pow(C[i,j] - C.exp[i,j], 2)/(C.exp[i, j] +.001)
+    #Simulated counts 
+    C.rep[i, j] ~ dbin(pct[i, j], N[i])
+    # Replicate discrepancy 
+    chi2.sim[i,j] <- pow(C.rep[i,j] - C.exp[i,j], 2)/(C.exp[i, j] +.001)
+  } # j
+} # i
+
+# chi-squared test statistics
+chi2.fit <- sum(chi2.act[,])
+chi2.fit.rep <- sum(chi2.sim[,])
+
+# Bayesian p-value
+bpvalue <- step(chi2.fit - chi2.fit.rep)
+    
+################################################################################
+# Population process model
+################################################################################
+# Priors for initial population size
+nrecr[1] ~ dunif(0, 10)
+nsurv[1] ~ dunif(0, 10)
+nimm[1] ~ dunif(0, 10)
+
+# Population dynamics
+for (t in 1:nyears){
+  ntot[t] <- nsurv[t] + nrecr[t] + nimm[t]
+}
+
+tau.lomega <- pow(sigma.lomega, -2)
+sigma.lomega ~ dunif(0, 10)
+lomega.mn <- log(omega.mn)
+omega.mn ~ dunif(0, 10)
+
+tau.lgamma <- pow(sigma.lgamma, -2)
+sigma.lgamma ~ dunif(0, 10)
+lgamma.mn <- log(gamma.mn)
+gamma.mn ~ dunif(0, 10)
+
+for (t in 1:(nyears-1)){
+
+  # Model for immigration
+    log.omega[t] ~ dnorm(lomega.mn, tau.lomega)
+    omega[t] <- exp(log.omega[t])
+
+  # Model for recruitment
+    log.gamma[t] ~ dnorm(lgamma.mn, tau.lgamma)
+    gamma[t] <- exp(log.gamma[t])
+}
+
+for (t in 2:nyears){
+  # Models for numbers of survivors, recruits, and adult immigrants
+  nsurv[t] ~ dnorm(ntot[t-1]*phit[t-1], 1/(ntot[t-1]*phit[t-1]*(1-phit[t-1])))T(0,)
+  nrecr[t] ~ dnorm(ntot[t-1]*gamma[t-1], 1/(ntot[t-1]*gamma[t-1]))T(0,)
+  nimm[t] ~ dnorm(ntot[t-1]*omega[t-1], 1/(ntot[t-1]*omega[t-1]))T(0,)
+} 
+
+################################################################################
+# MAPS CJS model for adult survival
+################################################################################
+
+# Priors for intercepts    
+p0 ~ dunif(0, 1)
+lp0 <- log(p0/(1-p0))
+rho0 ~ dunif(0, 1)
+lrho0 <- log(rho0/(1-rho0))
+
+# Random station effects for p and rho models 
+sigma.psta ~ dunif(0, 10)
+sigma.rhosta ~ dunif(0,10)
+tau.psta <- pow(sigma.psta, -2)
+tau.rhosta <- pow(sigma.rhosta, -2)
+    
+for(j in 1:nsta){
+  stap[j] ~ dnorm(0, tau.psta)
+  starho[j] ~ dnorm(0, tau.rhosta)
+}
+
+# year variance for phi and pi models    
+sigma.lphi ~ dunif(0, 10)
+sigma.lpi ~ dunif(0, 10)
+tau.lphi <- pow(sigma.lphi, -2)
+tau.lpi <- pow(sigma.lpi, -2)
+
+phi.mn ~ dunif(0, 1)
+lphi.mn <- logit(phi.mn)
+pi.mn ~ dunif(0, 1)
+lpi.mn <- logit(pi.mn)
+    
+for (t in 1:(nyears - 1)){
+  # Year-specific survival estimate
+  logit.phi[t] ~ dnorm(lphi.mn, tau.lphi)
+  phit[t] <- ilogit(logit.phi[t])
+  logit.pi[t] ~ dnorm(lpi.mn, tau.lpi)
+}
+
+# State-space likelihood for i individuals    
+for (i in 1:nind){
+    
+# Latent alive state at first occasion
+  for(t in 1:first[i]){
+    z[i,t] ~ dbern(1)
+  }
+  # Residency state based on first capture occasion
+  R[i] ~ dbern(pi[i,first[i]])
+  mu[i] <- R[i]*rho[i]
+  r[i] ~ dbern(mu[i])
+    
+  # logit-linear models
+  logit(p[i]) <- lp0 + stap[sta[i]] 
+  logit(rho[i]) <- lrho0 + starho[sta[i]] 
+  for (t in first[i]:(nyears-1)){
+    pi[i,t] <- ilogit(logit.pi[t])
+    phi[i,t] <- ilogit(logit.phi[t])
+  }
+  for (t in (first[i]+1):nyears){
+    # State process
+    mu2[i,t] <- z[i,t-1]*phi[i,t-1]*R[i]
+    z[i,t] ~ dbern(mu2[i,t])
+    # Observation process
+    mu1[i,t] <- p[i]*z[i,t]
+    y[i,t] ~ dbern(mu1[i,t])
+    pred_y[i,t] <- mu1[i,t]
+    ft1[i, t] <- (sqrt(y[i, t]) - sqrt(pred_y[i, t]))^2 
+    y.rep[i,t] ~ dbern(mu1[i,t])
+    ft1.rep[i,t] <- (sqrt(y.rep[i,t]) - sqrt(pred_y[i,t]))^2 
+  } # end t
+    fit_i[i] <- sum(ft1[i,(first[i]+1):nyears])          
+    fit.rep_i[i] <- sum(ft1.rep[i,(first[i]+1):nyears])
+} # end i
+    fit <- sum(fit_i[])           # test statistic for data
+    fit.rep <- sum(fit.rep_i[])   # test statistic for new predicted data
+    cjs.bpvalue <- step(fit.rep - fit)   # Test whether new data set more extreme
+
+################################################################################
+# Age structure model based on MAPS SY/ASY data
+################################################################################    
+
+tau.psista <- pow(sigma.psista, -2)
+sigma.psista ~ dunif(0, 10)
+
+for (i in 1:nsta){
+  sta.psi[i] ~ dnorm(0, tau.psista)
+}
+for (i in 1:M){
+  age[i] ~ dbern(psi[i])
+  logit(psi[i]) <- logit(nrecr[year[i]]/ntot[year[i]]) + sta.psi[station[i]]
+}
+}
+        

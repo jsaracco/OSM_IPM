@@ -2,35 +2,15 @@
 # Integrated population model for Oil Sands point count, ARU, and MAPS data
 #
 # In this version...
-#
-# Last edited 21 Oct. 2024, J. Saracco
 ################################################################################
 
 ## load libraries, functions ---------------------------------------------------
 library(data.table)
 library(tidyverse)
-Sys.setenv(JAGS_HOME = "C:\\Program Files\\JAGS\\JAGS-4.3.1")
 library(jagsUI)
 library(sf)
-
-# function to add transparency to plot colors
-add.alpha <- function(col, alpha=1){
-  if(missing(col))
-    stop("Please provide a vector of colours.")
-  apply(sapply(col, col2rgb)/255, 2, 
-        function(x) 
-          rgb(x[1], x[2], x[3], alpha=alpha))  
-}
-
-# transformations for logit-linear models 
-logit <- function(x){
-  y <- log(x/(1-x))
-  return(y)
-}
-expit <- function(x){
-  y <- exp(x)/(1+exp(x))
-  return(y)
-}
+library(plotrix)
+source("functions/tools.R")
 
 #-------------------------------------------------------------------------------
 # 1. Read in and process the point, aru, and covariate data
@@ -70,119 +50,72 @@ abmi_count_data <- read.csv("data/OSMIPMSupplementalARUData_5.csv") %>%
   as.data.frame()
 
 # 1.3 - covariate data -----------------------------
+# file from Elly Knight 20 Nov 2024
+covariate_data <- read.csv("data/OSMIPMCovariates&Suitability_5.csv", row.names = 1) %>% 
+  subset(!is.na(ALFL), select = - task_method)# 7 records with missing data
 
-covariate_data <- read.csv("data/OSMIPMCovariates_5.csv")
-
-# 1.4 - merge OMEI and ABMI data, subset ovenbirds -----------------------------
+# 1.4 - merge OMEI counts, ABMI counts, and covariate data ---------------------
 counts <- bind_rows(omei_count_data, abmi_count_data) %>% 
   group_by(location_id, project_id, year) %>% 
-  mutate(rep = frank(date_time, ties.method = "dense"))
+  mutate(rep = frank(date_time, ties.method = "dense")) %>% 
+  as.data.frame()
 
+# create list of unique counts (effort)
+ef <- unique(subset(counts, select = c(sensor, location_id, project_id, task_method, 
+                                       year, dis, dur, date_time, sunrise, tssr, rep))) %>% 
+  cross_join(data.frame(species_code = c("OVEN", "SWTH", "CAWA", "ALFL"))) %>% 
+  left_join(covariate_data) %>% 
+  subset(!(is.na(ef$OVEN)))
+  as.data.frame()
 
-library(MODISTools) # for EVI data download
+# subset target species
+counts <- counts %>% 
+  subset(species_code %in% c("OVEN", "SWTH", "CAWA", "ALFL")) %>%
+  right_join(ef) %>% 
+  mutate(count = replace_na(count, 0)) %>% 
+  as.data.frame()
 
-# download and process MODIS data
-get_modis <- function(dat, product, band, qa, start_year, end_year, start_mmdd,
-                      end_mmdd, km_buff){
-  require(MODISTools)
-  start_year2 <- ifelse(as.numeric(substr(end_mmdd, 1, 2)) < as.numeric(substr(start_mmdd, 1, 2)),
-                        start_year + 1, start_year)
-  
-  x <- mt_batch_subset(dat, product, band, start = paste(start_year, start_mmdd, sep = "-"),
-                       end = paste(start_year2, end_mmdd, sep = "-"),
-                       km_lr = km_buff, km_ab = km_buff, internal = TRUE)
-  x$value[x$value < -2000] <- NA # valid range: -2000 to 10000 (-3000 = fill value)
-  if(!missing(qa)){
-    q <- mt_batch_subset(dat, product, band = qa,
-                         start = paste(start_year[1], start_mmdd, sep = "-"),
-                         end = paste(start_year2, end_mmdd, sep = "-"),
-                         km_lr = km_buff, km_ab = km_buff, internal = TRUE)
-    x$value[q$value > 1] <- NA # keep only marginal and good quality pixels
-    rm(q)
-  }
-  for (i in (start_year + 1):end_year){
-    sy2 <- ifelse(start_year2 > start_year, i + 1, i)
-    y <- mt_batch_subset(dat, product, band,
-                         start = paste(i, start_mmdd, sep = "-"),
-                         end = paste(sy2, end_mmdd, sep = "-"),
-                         km_lr = km_buff, km_ab = km_buff, internal = TRUE)
-    y$value[y$value < -2000] <- NA # valid range: -2000 to 10000 (-3000 = fill value)
-    if(!missing(qa)){
-      q <- mt_batch_subset(dat, product, band = qa,
-                           start = paste(i, start_mmdd, sep = "-"),
-                           end = paste(sy2, end_mmdd, sep = "-"),
-                           km_lr = km_buff, km_ab = km_buff, internal = TRUE)
-      y$value[q$value > 1] <- NA # keep only marginal and good quality pixels
-      x <- bind_rows(x, y)
-      rm(y, q, sy2)
-    }
-  }
-  xsum <- x %>%
-    group_by(latitude, longitude, site, calendar_date) %>%
-    summarize(evi = mean(value, na.rm = TRUE))
-  xsum$evi <- xsum$evi/10000
-  xsum$calendar_date <- as.Date(xsum$calendar_date)
-  xsum$Month <- as.character(format(xsum$calendar_date, format="%m"))
-  xsum$Year <- as.character(format(xsum$calendar_date, format="%Y"))
-  xsumSEASON <- ifelse(xsum$Month %in% c("11", "12"), as.numeric(xsum$Year) + 1, as.numeric(xsum$Year))
-  
-  return(list(x, xsum))
+# create numeric count duration variable
+counts$dur.num <- as.numeric(counts$dur)
+counts$dur.num[counts$dur %in% "0-3-5-10min"] <- 10
+counts$dur.num[counts$dur %in% "120s"] <- 2
+counts$dur.num[counts$dur %in% "180s"] <- 3
+counts$dur.num[counts$dur %in% "300s"] <- 5
+counts$dur.num[counts$dur %in% "540s"] <- 9
+counts$dur.num[counts$dur %in% "600s"] <- 10
+counts$dur.num[counts$dur %in% "60s"] <- 1
+
+spec <- c("OVEN", "SWTH", "CAWA", "ALFL")
+
+for (i in 1:length(spec)){
+  assign(paste(spec[i], "counts", sep = "_"), subset(counts, counts$species_code %in% spec[i])) %>% 
+    merge(ef, all.y = TRUE) %>% 
+    mutate(count = replace_na(count, 0)) %>% 
+    as.data.frame()
 }
 
-locs <- counts %>% subset(select = c(location_id, lat, lon, year)) %>% unique()
+aggregate(count ~ task_method + dur.num, counts, length)
+# task_method dur.num count
+# 1         1SPM       1    24
+# 2         1SPM       2    20
+# 3         1SPM       3 25536
+# 4         1SPT       3  6912
+# 5         1SPM       5    64
+# 6         1SPM       9    40
+# 7         1SPT       9     4
+# 8         1SPM      10  1064
+# 9         1SPT      10   420
+# 10          PC      10  5056
 
-
-dat <- data.frame(site_name = locs$location_id, lat = locs$lat, lon = locs$lon)
-modis_out <- get_modis(dat = dat, product = "MOD13Q1", band = "250m_16_days_NDVI",
-                            qa = "250m_16_days_pixel_reliability",
-                            start_year = 2011, end_year = 2023,
-                            start_mmdd = "06-01", end_mmdd = "07-30",
-                            km_buff = 0)
-
-write.csv(modis_out[[1]], "data/modis_out1.csv", row.names = FALSE)
-write.csv(modis_out[[2]], "data/modis_out2.csv", row.names = FALSE)
-
-modis_sum <- modis_out[[2]] %>% group_by(latitude, longitude, site, Year) %>% 
-  summarize(evi = mean(evi, na.rm = TRUE)) %>% 
-  rename(lat = latitude, lon = longitude, location_id = site, year = Year) %>% 
-  mutate(year = as.integer(year))
-
-
-
-ef <- unique(subset(counts, select = c(sensor, location_id, project_id, task_method, year, lat, lon, dis, dur, date_time, sunrise, tssr, rep)))
-
-oven_counts <- counts %>% subset(species_code %in% "OVEN")
-oven_counts <- right_join(oven_counts, ef)
-oven_counts$count[is.na(oven_counts$count)] <- 0
-oven_counts <- as.data.frame(oven_counts)
-
-oven_counts$dur.num <- as.numeric(oven_counts$dur)
-oven_counts$dur.num[oven_counts$dur %in% "0-3-5-10min"] <- 10
-oven_counts$dur.num[oven_counts$dur %in% "120s"] <- 2
-oven_counts$dur.num[oven_counts$dur %in% "180s"] <- 3
-oven_counts$dur.num[oven_counts$dur %in% "300s"] <- 5
-oven_counts$dur.num[oven_counts$dur %in% "540s"] <- 9
-oven_counts$dur.num[oven_counts$dur %in% "600s"] <- 10
-oven_counts$dur.num[oven_counts$dur %in% "60s"] <- 1
-
-x <- aggregate(count ~ task_method + dur.num, oven_counts, length)
-# 1        1SPM       1     4
-# 2        1SPM       2     1
-# 3        1SPM       3  4689
-# 4        1SPT       3   958
-# 5        1SPM       5     9
-# 6        1SPM       9     5
-# 7        1SPM      10   231
-# 8          PC      10  1002
-oven_counts <- subset(oven_counts, dur.num == 3 | dur.num == 10)
-oven_counts$sens_dur <- paste(oven_counts$sensor, oven_counts$dur.num, sep=".")
-oven_counts$meth_dur <- paste(oven_counts$task_method, oven_counts$dur.num, sep=".")
+counts$sens_dur <- paste(counts$sensor, counts$dur.num, sep=".")
+counts$meth_dur <- paste(counts$task_method, counts$dur.num, sep=".")
 
 # plot(oven_counts$offset ~ oven_counts$dur.num)
 # # for nmix model
-oven_counts_wide <- oven_counts %>%
-  pivot_wider(id_cols = c(sensor, project_id, task_method, meth_dur, sens_dur, location_id, lat, lon, year),
-              names_from = rep, names_sort = TRUE, values_from = c(count, offset)) %>%
+counts_wide <- counts %>%
+  pivot_wider(id_cols = c(species_code, sensor, project_id, task_method, dur.num, meth_dur, sens_dur, location_id, lat, lon, year, OVEN,
+                          SWTH, CAWA, ALFL),
+              names_from = rep, names_sort = TRUE, values_from = c(count), names_prefix = "count") %>%
   as.data.frame()
 #-------------------------------------------------------------------------------
 # 2. Read in and process MAPS CMR data
@@ -192,8 +125,8 @@ oven_counts_wide <- oven_counts %>%
 # sex codes: 1 = F, 2 = M, 3 = U
 
 ch <- foreign::read.dbf("data/OSM_CH.dbf") %>% 
-  subset(!(LOSS %in% "-1") & SPEC %in% "OVEN", 
-         c(STA, STATION, BAND, SPEC, AGE, SEX, Y2011:Y2023, MARKED))
+  subset(!(LOSS %in% "-1") & SPEC %in% c("OVEN", "SWTH", "CAWA", "ALFL"), 
+         select = c(STA, STATION, BAND, SPEC, AGE, SEX, Y2011:Y2023, MARKED))
 ch$STATION  <- as.character(ch$STATION)
 ch$STATION[ch$STA %in% "18812"] <- "BPND"
 ch$STATION[ch$STA %in% "18814"] <- "VWET"
@@ -235,15 +168,27 @@ pct0[i] ~ dunif(0, 1)
 
 pocc ~ dunif(0, 1)
 
+tau_loc <- pow(sigma_loc, -2)
+sigma_loc ~ dunif(0, 10)
+
+a1 ~ dnorm(0, 0.01)
+b1 ~ dnorm(0, 0.01)
+
+for (i in 1:nlocs){
+pt[i] ~ dnorm(0, tau_loc)
+}
+
 for (j in 1:nlocs){
 zeta[j] ~ dbern(pocc)
 }
 for (i in 1:ncts){ 
-N[i] ~ dpois(ntot[YR[i]]*zeta[location[i]])
+N[i] ~ dpois(mu_abund[i]*zeta[location[i]])
+log(mu_abund[i]) = log(ntot[YR[i]]) + b1*hab[i] + pt[loc_id[i]]
+
   for (j in 1:nrep){
 # Count model-------------------------------------------------------------------
     C[i, j] ~ dbin(pct[i, j], N[i])
-    logit(pct[i, j]) <- lpct0[meth[i]] 
+    logit(pct[i, j]) <- lpct0[meth[i]] + a1*dur[i]
     # Expected count 
     C.exp[i, j] <- pct[i, j] * N[i]
     # Data discrepancy 
@@ -298,9 +243,9 @@ for (t in 1:(nyears-1)){
 
 for (t in 2:nyears){
   # Models for numbers of survivors, recruits, and adult immigrants
-  nsurv[t] <- ntot[t-1]*phit[t-1]
-  nrecr[t] <- ntot[t-1]*gamma[t-1]
-  nimm[t] <- ntot[t-1]*omega[t-1]
+  nsurv[t] ~ dnorm(ntot[t-1]*phit[t-1], 1/(ntot[t-1]*phit[t-1]*(1-phit[t-1])))T(0,)
+  nrecr[t] ~ dnorm(ntot[t-1]*gamma[t-1], 1/(ntot[t-1]*gamma[t-1]))T(0,)
+  nimm[t] ~ dnorm(ntot[t-1]*omega[t-1], 1/(ntot[t-1]*omega[t-1]))T(0,)
 } 
 
 ################################################################################
@@ -398,15 +343,19 @@ for (i in 1:M){
         ",fill = TRUE)
 sink()
 
+i = "OVEN"
+CH <- ch[ch$SPEC %in% i,]
+COUNTS <- counts_wide[counts_wide$species_code %in% i,]
+SYDAT <- sydat[sydat$SPEC %in% i,]
 
 # Define data for CJS model
-r <- as.numeric(ch$MARKED) 
-y <- as.matrix(ch[,7:19])
+r <- as.numeric(CH$MARKED) 
+y <- as.matrix(CH[,7:19])
 class(y) <- "numeric"
-sta <- as.numeric(factor(ch$STA))
+sta <- as.numeric(factor(CH$STA))
 nsta <- max(sta)
 nind <- nrow(y)
-first <- ch$first
+first <- CH$first
 nyears <- dim(y)[2]
 
 # Initial state values for CJS model
@@ -416,48 +365,46 @@ Zst[is.na(Zst)]<-1
 Rst<-rep(1,nrow(y))
 
 # Define data for age-structure model
-M <- nrow(sydat)
-age <- sydat$age2
-year <- sydat$year
-station <- as.numeric(factor(sydat$STA))
+M <- nrow(SYDAT)
+age <- SYDAT$age2
+year <- SYDAT$year
+station <- as.numeric(factor(SYDAT$STA))
 
-C <- subset(oven_counts_wide, select = count_1:count_4)
-# pc.ind <- ifelse(oven_counts_wide$sensor %in% "PC", 1, 0)
-
-evi <- (oven_counts_wide$evi - mean(oven_counts_wide$evi, na.rm=TRUE))
-
+C <- subset(COUNTS, select = count1:count4)
 ncts <- dim(C)[1]
-proj <- as.numeric(factor(oven_counts_wide$project_id))
+proj <- as.numeric(factor(COUNTS$project_id))
 nproj <- max(proj)
-meth <- as.numeric(factor(oven_counts$meth_dur))
+meth <- as.numeric(factor(COUNTS$task_method))
 nmeths <- max(meth)
-location <- as.numeric(factor(oven_counts_wide$location_id))
-nlocs <- max(location)
-YR <- as.numeric(oven_counts_wide$year) - 2010
+loc_id <- as.numeric(factor(COUNTS$location_id))
+nlocs <- max(loc_id)
+YR <- as.numeric(COUNTS$year) - 2010
+hab <- (COUNTS[,i] - mean(COUNTS[,i]))/sd(COUNTS[,i])
+dur <- (COUNTS$dur.num - mean(COUNTS$dur.num))/sd(COUNTS$dur.num)
 
 
 # Initial values for population size of n-mixture model
-oven_counts_wide$N.st <- apply(C, 1, max, na.rm=T)
-nrecr.st <- nsurv.st <- nimm.st <- aggregate(N.st ~ year, oven_counts_wide, mean)$N.st/3
+COUNTS$N.st <- apply(C, 1, max, na.rm=T)
+nrecr.st <- nsurv.st <- nimm.st <- aggregate(N.st ~ year, COUNTS, mean)$N.st/3
 
-jags_dat <- list(C = C, ncts = ncts, nrep = 4, meth = meth, nmeths = nmeths, pc.ind = pc.ind,
+jags_dat <- list(C = C, ncts = ncts, nrep = 4, meth = meth, nmeths = nmeths, 
                  YR = YR, nyears = nyears, r = r, y = y, sta = sta, nsta = nsta, 
-                 location=location, nlocs=nlocs,
+                 location=location, nlocs=nlocs, hab = hab, loc_id = loc_id, dur = dur,
                  nind=nind, first = first, M = M, age = age, station = station, year = year)
 
-inits <- function(){list(N = oven_counts_wide$N.st, sigma.rhosta = runif(1), pocc = runif(1),
+inits <- function(){list(N = COUNTS$N.st, sigma.rhosta = runif(1), pocc = runif(1),
                          sigma.psta = runif(1), nsurv1=nsurv.st[1], nrecr1=nrecr.st[1], 
                          nimm1=nimm.st[1], pct0 = runif(nmeths, .2, .6), sigma.lpi = runif(1), 
                          method = runif(nmeths, -2, 2), sigma.lphi = runif(1), 
-                         p0 = runif(1, .2, .5), rho0 = runif(1, 0.1, 0.5), 
+                         p0 = runif(1, .2, .5), rho0 = runif(1, 0.1, 0.5), a1 = 0, b1 = 0,
                          phi.mn = runif(1, 0.1, 0.5), pi.mn = runif(1, 0.2, 0.8), R = Rst, 
                          z = Zst, sigma.yr = runif(1), sigma.psista = runif(1), tau.e = 1,
                          gamma.mn = runif(1, .1, 1.1), omega.mn = runif(1, .1, 1.1), 
-                         sigma.lgamma = runif(1), sigma.lomega = runif(1))}
+                         sigma.lgamma = runif(1), sigma.lomega = runif(1), sigma_loc = runif(1))}
 
 parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "bpvalue", "cjs.bpvalue",
                 "phit", "phi.mn", "pimn", "p0", "gamma", "omega", "omega.mn", "pct0",
-                "gamma.mn", "b1", "sigma.lgamma", "pocc", 
+                "gamma.mn", "b1", "sigma.lgamma", "pocc", "a1", "b1", "sigma_loc",
                 "sigma.lphi", "sigma.lpi", "sigma.lomega")
 
 # 
@@ -517,7 +464,7 @@ pct.med <- apply(oven_ipm_fit1$sims.list$pct0, 2, median)
 pct.li <- apply(oven_ipm_fit1$sims.list$pct0, 2, quantile, probs = 0.05)
 pct.ui <- apply(oven_ipm_fit1$sims.list$pct0, 2, quantile, probs = 0.95)
 
-library(plotrix)
+
 png("Report_figs/detec.png", height = 4, width = 6.5, res = 600, units = "in")
 par(mar = c(4,4,1,1))
 plotCI(y = pct.med[c(2,3,1,4)], x = c(1, 2, 3, 4), li = pct.li[c(2,3,1,4)], ui = pct.ui[c(2,3,1,4)], 
