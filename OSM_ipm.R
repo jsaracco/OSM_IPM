@@ -60,12 +60,14 @@ counts <- bind_rows(omei_count_data, abmi_count_data) %>%
   mutate(rep = frank(date_time, ties.method = "dense")) %>% 
   as.data.frame()
 
+rm(abmi_count_data, omei_count_data)
+
 # create list of unique counts (effort)
 ef <- unique(subset(counts, select = c(sensor, location_id, project_id, task_method, 
                                        year, dis, dur, date_time, sunrise, tssr, rep))) %>% 
   cross_join(data.frame(species_code = c("OVEN", "SWTH", "CAWA", "ALFL"))) %>% 
   left_join(covariate_data) %>% 
-  subset(!(is.na(ef$OVEN)))
+  subset(!(is.na(ef$OVEN))) %>% 
   as.data.frame()
 
 # subset target species
@@ -87,12 +89,12 @@ counts$dur.num[counts$dur %in% "60s"] <- 1
 
 spec <- c("OVEN", "SWTH", "CAWA", "ALFL")
 
-for (i in 1:length(spec)){
-  assign(paste(spec[i], "counts", sep = "_"), subset(counts, counts$species_code %in% spec[i])) %>% 
-    merge(ef, all.y = TRUE) %>% 
-    mutate(count = replace_na(count, 0)) %>% 
-    as.data.frame()
-}
+# for (i in 1:length(spec)){
+#   assign(paste(spec[i], "counts", sep = "_"), subset(counts, counts$species_code %in% spec[i])) %>% 
+#     merge(ef, all.y = TRUE) %>% 
+#     mutate(count = replace_na(count, 0)) %>% 
+#     as.data.frame()
+# }
 
 aggregate(count ~ task_method + dur.num, counts, length)
 # task_method dur.num count
@@ -121,91 +123,84 @@ counts_wide <- counts %>%
 # 2. Read in and process MAPS CMR data
 #-------------------------------------------------------------------------------
 
-# note that in this version age codes: 1 = AHY, 2 = SY, 3 = ASY and 
-# sex codes: 1 = F, 2 = M, 3 = U
-
-ch <- foreign::read.dbf("data/OSM_CH.dbf") %>% 
+ch <- foreign::read.dbf("data/FOURCH.dbf") %>% 
   subset(!(LOSS %in% "-1") & SPEC %in% c("OVEN", "SWTH", "CAWA", "ALFL"), 
-         select = c(STA, STATION, BAND, SPEC, AGE, SEX, Y2011:Y2023, MARKED))
-ch$STATION  <- as.character(ch$STATION)
-ch$STATION[ch$STA %in% "18812"] <- "BPND"
-ch$STATION[ch$STA %in% "18814"] <- "VWET"
-ch$STATION <- as.factor(ch$STATION)
-ch[ch == "N"] <- NA # missed occasions
-ch[,7:19] <- lapply(ch[,7:19], as.numeric) 
-ch[,7:19] <- ch[,7:19]-1
+         select = c(STA, BAND, SPEC, AGE, SEX, Y1:Y13, MARKED)) %>% 
+  mutate(across(Y1:Y13, ~replace(., . ==  "n" , NA))) %>% # missed occasions
+  mutate_at(vars(Y1:Y13), as.numeric) %>% 
+  mutate_at(vars(Y1:Y13), ~.-1)
 ch$last <- ch$first <- NA
 for(i in 1:nrow(ch)){
-  h <- as.vector(ch[i,7:19])
+  h <- as.vector(ch[i,6:18])
   ch$first[i] <- min( (1:13)[!is.na(h) & h==1])
   ch$last[i]  <- max( (1:13)[!is.na(h) & h==1])
 }
 
 # Process age structure data
-sydat <- ch %>% pivot_longer(cols = Y2011:Y2023, names_to = "year") %>% 
-  mutate(year = as.numeric(factor(year))) %>% 
+sydat <- ch %>% pivot_longer(cols = Y1:Y13, names_to = "year") %>% 
+  mutate(year = as.numeric(factor(year, levels = paste0("Y", 1:13)))) %>% 
   subset(value == 1)
 sydat$AGE[sydat$AGE == 1] <- NA
 sydat$age.init <- NA
-sydat$age.init[sydat$AGE == 2] <- 1
-sydat$age.init[sydat$AGE == 3] <- 0
-sydat$age2 <- ifelse(sydat$year == sydat$first, sydat$age.init, 0)
+sydat$age.init[sydat$AGE == 5] <- 1
+sydat$age.init[sydat$AGE == 6] <- 0
+sydat$age2 <- NA
+sydat$age2[sydat$year == sydat$first] <- sydat$age.init[sydat$year == sydat$first]
+sydat$age2[sydat$age.init == 1 & sydat$year != sydat$first] <- 0
+sydat$age2[is.na(sydat$age.init) & sydat$year != sydat$first] <- 0
+
 
 ch <- subset(ch, first < 13) # first encounter on last occasion does not inform CJS model
 
-sink("ipm_zip.txt")
+sink("ipm1.txt")
 cat("
 model{
-    
 # Priors------------------------------------------------------------------------
+sigma.e ~ dunif(0, 10)
+tau.e <- pow(sigma.e, -2)
 
-# Method intercept for detection probability. levels 1 and 2 are methods of 
-# counting from ARU recordings. Level 3 is human point count
+for (i in 1:nlocs){
+e[i] ~ dnorm(0, tau.e) 
+}
+
+a1 ~ dnorm(0, 0.01)
+b1 ~ dnorm(0, 0.01)
+
 for (i in 1:nmeths){
 lpct0[i] <- log(pct0[i]/(1-pct0[i]))
 pct0[i] ~ dunif(0, 1)
 }
 
-pocc ~ dunif(0, 1)
-
-tau_loc <- pow(sigma_loc, -2)
-sigma_loc ~ dunif(0, 10)
-
-a1 ~ dnorm(0, 0.01)
-b1 ~ dnorm(0, 0.01)
-
-for (i in 1:nlocs){
-pt[i] ~ dnorm(0, tau_loc)
-}
-
-for (j in 1:nlocs){
-zeta[j] ~ dbern(pocc)
-}
-for (i in 1:ncts){ 
-N[i] ~ dpois(mu_abund[i]*zeta[location[i]])
-log(mu_abund[i]) = log(ntot[YR[i]]) + b1*hab[i] + pt[loc_id[i]]
-
+for (i in 1:ncts){
+# Abundance model --------------------------------------------------------------
+N[i] ~ dpois(mu.n[i])
+log(mu.n[i]) <- log(ntot[YR[i]]) + b1*hab[i] + e[loc_id[i]]
   for (j in 1:nrep){
 # Count model-------------------------------------------------------------------
     C[i, j] ~ dbin(pct[i, j], N[i])
-    logit(pct[i, j]) <- lpct0[meth[i]] + a1*dur[i]
+    logit(pct[i, j]) <- lpct0[meth[i]] + a1*dur[i] 
     # Expected count 
-    C.exp[i, j] <- pct[i, j] * N[i]
+    C.exp[i, j] <- pct[i, j]*N[i] 
     # Data discrepancy 
     chi2.act[i,j] <- pow(C[i,j] - C.exp[i,j], 2)/(C.exp[i, j] +.001)
+    TFD.act[i, j] <- (sqrt(C[i, j]) - sqrt(C.exp[i, j]))^2 
     #Simulated counts 
     C.rep[i, j] ~ dbin(pct[i, j], N[i])
     # Replicate discrepancy 
     chi2.sim[i,j] <- pow(C.rep[i,j] - C.exp[i,j], 2)/(C.exp[i, j] +.001)
+    TFD.sim[i, j] <- (sqrt(C.rep[i, j]) - sqrt(C.exp[i, j]))^2 
   } # j
 } # i
 
 # chi-squared test statistics
 chi2.fit <- sum(chi2.act[,])
 chi2.fit.rep <- sum(chi2.sim[,])
+TFD.fit <- sum(TFD.act[,])
+TFD.fit.rep <- sum(TFD.sim[,])
 
 # Bayesian p-value
-bpvalue <- step(chi2.fit - chi2.fit.rep)
+bpvalue1 <- step(chi2.fit - chi2.fit.rep)
+bpvalue2 <- step(TFD.fit - TFD.fit.rep)
     
 ################################################################################
 # Population process model
@@ -220,32 +215,35 @@ for (t in 1:nyears){
   ntot[t] <- nsurv[t] + nrecr[t] + nimm[t]
 }
 
-tau.lomega <- pow(sigma.lomega, -2)
-sigma.lomega ~ dunif(0, 10)
-lomega.mn <- log(omega.mn)
-omega.mn ~ dunif(0, 10)
-
-tau.lgamma <- pow(sigma.lgamma, -2)
-sigma.lgamma ~ dunif(0, 10)
-lgamma.mn <- log(gamma.mn)
-gamma.mn ~ dunif(0, 10)
+tau.omegayr <- pow(sigma.omegayr, -2)
+sigma.omegayr ~ dunif(0, 10)
+log.mu.omega <- log(mu.omega)
+mu.omega ~ dunif(0, 10)
 
 for (t in 1:(nyears-1)){
-
+  # Assume variances of zero-truncated normals equivalent to variances 
+  # of discrete binomial (survival) and poisson (recruitment) models
+  tau.nsurv[t] <- 1/(ntot[t]*phi.hat[t]*(1-phi.hat[t]))
+  tau.nrecr[t] <- 1/(ntot[t]*gamma[t])
+  tau.nimm[t] <- 1/(ntot[t]*omega[t])
+  
   # Model for immigration
-    log.omega[t] ~ dnorm(lomega.mn, tau.lomega)
-    omega[t] <- exp(log.omega[t])
+  log(omega[t]) <- log.mu.omega + omegayr[t]
+  omegayr[t] ~ dnorm(0, tau.omegayr)
 
   # Model for recruitment
-    log.gamma[t] ~ dnorm(lgamma.mn, tau.lgamma)
-    gamma[t] <- exp(log.gamma[t])
+  log(gamma[t]) <- lgamma0 + gamyr[t] 
+  gamyr[t] ~ dnorm(0, tau.gamyr)
 }
+tau.gamyr <- pow(sigma.gamyr, -2)
+sigma.gamyr ~ dunif(0, 10)
+lgamma0 ~ dnorm(0, 0.01)
 
 for (t in 2:nyears){
   # Models for numbers of survivors, recruits, and adult immigrants
-  nsurv[t] ~ dnorm(ntot[t-1]*phit[t-1], 1/(ntot[t-1]*phit[t-1]*(1-phit[t-1])))T(0,)
-  nrecr[t] ~ dnorm(ntot[t-1]*gamma[t-1], 1/(ntot[t-1]*gamma[t-1]))T(0,)
-  nimm[t] ~ dnorm(ntot[t-1]*omega[t-1], 1/(ntot[t-1]*omega[t-1]))T(0,)
+  nsurv[t] ~ dnorm(ntot[t-1]*phi.hat[t-1], tau.nsurv[t-1])T(0,) 
+  nrecr[t] ~ dnorm(ntot[t-1]*gamma[t-1], tau.nrecr[t-1])T(0,)
+  nimm[t] ~ dnorm(ntot[t-1]*omega[t-1], tau.nimm[t-1])T(0,)
 } 
 
 ################################################################################
@@ -257,7 +255,11 @@ p0 ~ dunif(0, 1)
 lp0 <- log(p0/(1-p0))
 rho0 ~ dunif(0, 1)
 lrho0 <- log(rho0/(1-rho0))
-
+phi0 ~ dunif(0, 1)
+lphi0 <- log(phi0/(1-phi0))
+pi0 ~ dunif(0, 1)
+lpi0 <- log(pi0/(1-pi0))
+    
 # Random station effects for p and rho models 
 sigma.psta ~ dunif(0, 10)
 sigma.rhosta ~ dunif(0,10)
@@ -269,22 +271,17 @@ for(j in 1:nsta){
   starho[j] ~ dnorm(0, tau.rhosta)
 }
 
-# year variance for phi and pi models    
-sigma.lphi ~ dunif(0, 10)
-sigma.lpi ~ dunif(0, 10)
-tau.lphi <- pow(sigma.lphi, -2)
-tau.lpi <- pow(sigma.lpi, -2)
-
-phi.mn ~ dunif(0, 1)
-lphi.mn <- logit(phi.mn)
-pi.mn ~ dunif(0, 1)
-lpi.mn <- logit(pi.mn)
+# Random year effects for phi and pi models    
+sigma.phiyr ~ dunif(0, 10)
+sigma.piyr ~ dunif(0, 10)
+tau.phiyr <- pow(sigma.phiyr, -2)
+tau.piyr <- pow(sigma.piyr, -2)
     
 for (t in 1:(nyears - 1)){
+  phiyr[t] ~ dnorm(0, tau.phiyr)
+  piyr[t] ~ dnorm(0, tau.piyr)
   # Year-specific survival estimate
-  logit.phi[t] ~ dnorm(lphi.mn, tau.lphi)
-  phit[t] <- ilogit(logit.phi[t])
-  logit.pi[t] ~ dnorm(lpi.mn, tau.lpi)
+  phi.hat[t] <- exp(lphi0 + phiyr[t])/(1+ exp(lphi0 + phiyr[t]))
 }
 
 # State-space likelihood for i individuals    
@@ -303,9 +300,10 @@ for (i in 1:nind){
   logit(p[i]) <- lp0 + stap[sta[i]] 
   logit(rho[i]) <- lrho0 + starho[sta[i]] 
   for (t in first[i]:(nyears-1)){
-    pi[i,t] <- ilogit(logit.pi[t])
-    phi[i,t] <- ilogit(logit.phi[t])
+    logit(pi[i,t]) <- lpi0 + piyr[t] 
+    logit(phi[i,t]) <- lphi0 + phiyr[t]
   }
+    
   for (t in (first[i]+1):nyears){
     # State process
     mu2[i,t] <- z[i,t-1]*phi[i,t-1]*R[i]
@@ -313,17 +311,8 @@ for (i in 1:nind){
     # Observation process
     mu1[i,t] <- p[i]*z[i,t]
     y[i,t] ~ dbern(mu1[i,t])
-    pred_y[i,t] <- mu1[i,t]
-    ft1[i, t] <- (sqrt(y[i, t]) - sqrt(pred_y[i, t]))^2 
-    y.rep[i,t] ~ dbern(mu1[i,t])
-    ft1.rep[i,t] <- (sqrt(y.rep[i,t]) - sqrt(pred_y[i,t]))^2 
   } # end t
-    fit_i[i] <- sum(ft1[i,(first[i]+1):nyears])          
-    fit.rep_i[i] <- sum(ft1.rep[i,(first[i]+1):nyears])
 } # end i
-    fit <- sum(fit_i[])           # test statistic for data
-    fit.rep <- sum(fit.rep_i[])   # test statistic for new predicted data
-    cjs.bpvalue <- step(fit.rep - fit)   # Test whether new data set more extreme
 
 ################################################################################
 # Age structure model based on MAPS SY/ASY data
@@ -343,14 +332,15 @@ for (i in 1:M){
         ",fill = TRUE)
 sink()
 
-i = "OVEN"
+# i = "OVEN"
+i = "SWTH"
 CH <- ch[ch$SPEC %in% i,]
 COUNTS <- counts_wide[counts_wide$species_code %in% i,]
 SYDAT <- sydat[sydat$SPEC %in% i,]
 
 # Define data for CJS model
-r <- as.numeric(CH$MARKED) 
-y <- as.matrix(CH[,7:19])
+r <- as.numeric(CH$MARKED) -1
+y <- as.matrix(CH[,6:18])
 class(y) <- "numeric"
 sta <- as.numeric(factor(CH$STA))
 nsta <- max(sta)
@@ -360,8 +350,10 @@ nyears <- dim(y)[2]
 
 # Initial state values for CJS model
 Zst<-y
-Zst[Zst==0]<-1
-Zst[is.na(Zst)]<-1
+for (j in 1:nrow(Zst)){
+  Zst[j,CH$first[j]:CH$last[j]] <- 1
+  Zst[Zst != 1 | is.na(Zst)]<-0
+}
 Rst<-rep(1,nrow(y))
 
 # Define data for age-structure model
@@ -372,7 +364,7 @@ station <- as.numeric(factor(SYDAT$STA))
 
 C <- subset(COUNTS, select = count1:count4)
 ncts <- dim(C)[1]
-proj <- as.numeric(factor(COUNTS$project_id))
+# proj <- as.numeric(factor(COUNTS$project_id))
 nproj <- max(proj)
 meth <- as.numeric(factor(COUNTS$task_method))
 nmeths <- max(meth)
@@ -382,38 +374,43 @@ YR <- as.numeric(COUNTS$year) - 2010
 hab <- (COUNTS[,i] - mean(COUNTS[,i]))/sd(COUNTS[,i])
 dur <- (COUNTS$dur.num - mean(COUNTS$dur.num))/sd(COUNTS$dur.num)
 
+# 
 
 # Initial values for population size of n-mixture model
-COUNTS$N.st <- apply(C, 1, max, na.rm=T)
+COUNTS$N.st <- apply(C, 1, max, na.rm=T)*3
 nrecr.st <- nsurv.st <- nimm.st <- aggregate(N.st ~ year, COUNTS, mean)$N.st/3
 
-jags_dat <- list(C = C, ncts = ncts, nrep = 4, meth = meth, nmeths = nmeths, 
-                 YR = YR, nyears = nyears, r = r, y = y, sta = sta, nsta = nsta, 
-                 location=location, nlocs=nlocs, hab = hab, loc_id = loc_id, dur = dur,
-                 nind=nind, first = first, M = M, age = age, station = station, year = year)
+jags_dat <- list(C = C, ncts = ncts, nrep = 4, YR = YR, nyears = nyears, r = r, y = y, sta = sta, nsta = nsta, hab = hab, meth = meth, dur=dur,
+                 nmeths = nmeths, nind=nind, first = first, M = M, age = age, station = station, year = year, loc_id = loc_id, nlocs = nlocs)
 
-inits <- function(){list(N = COUNTS$N.st, sigma.rhosta = runif(1), pocc = runif(1),
-                         sigma.psta = runif(1), nsurv1=nsurv.st[1], nrecr1=nrecr.st[1], 
-                         nimm1=nimm.st[1], pct0 = runif(nmeths, .2, .6), sigma.lpi = runif(1), 
-                         method = runif(nmeths, -2, 2), sigma.lphi = runif(1), 
-                         p0 = runif(1, .2, .5), rho0 = runif(1, 0.1, 0.5), a1 = 0, b1 = 0,
-                         phi.mn = runif(1, 0.1, 0.5), pi.mn = runif(1, 0.2, 0.8), R = Rst, 
-                         z = Zst, sigma.yr = runif(1), sigma.psista = runif(1), tau.e = 1,
-                         gamma.mn = runif(1, .1, 1.1), omega.mn = runif(1, .1, 1.1), 
-                         sigma.lgamma = runif(1), sigma.lomega = runif(1), sigma_loc = runif(1))}
+inits <- function(){list(nrecr = nrecr.st, nsurv = nsurv.st, nimm = nimm.st, N = COUNTS$N.st, b1 = rnorm(1), a1 = rnorm(1),
+                         sigma.rhosta = runif(1), sigma.psta = runif(1), nsurv1=nsurv.st[1], nrecr1=nrecr.st[1],
+                         nimm1=nimm.st[1], sigma.phiyr = runif(1), sigma.piyr = runif(1), p0 = runif(1, .2, .5), 
+                         rho0 = runif(1, 0.1, 0.5), phi0 = runif(1, 0.1, 0.5), pi0 = runif(1, 0.2, 0.8), R = Rst, 
+                         z = Zst, sigma.yr = runif(1), sigma.psista = runif(1), sigma.e = 1, pct0 = runif(nmeths, .4, .7),
+                         lgamma0 = rnorm(1), mu.omega = runif(1, .2, 2), 
+                         sigma.gamyr = runif(1), sigma.omega = runif(1))}
 
-parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "bpvalue", "cjs.bpvalue",
-                "phit", "phi.mn", "pimn", "p0", "gamma", "omega", "omega.mn", "pct0",
-                "gamma.mn", "b1", "sigma.lgamma", "pocc", "a1", "b1", "sigma_loc",
-                "sigma.lphi", "sigma.lpi", "sigma.lomega")
+parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "TFD.fit", "a1", "b1",
+                "TFD.fit.rep", "bpvalue1", "bpvalue2", "phi.hat", "phi0", "pi0", 
+                "p0", "gamma", "omega", "mu.omega", "omegayr", "pct0", "sigma.gamyr", 
+                "sigma.proj", "sigma.el", "sigma.e","sigma.phiyr", "sigma.omegayr")
 
 # 
 ## MCMC settings
-ni <- 120000
+ni <- 200000
 nc <- 3
-na <- 40000
-nb <- 40000
-nt <- 5
+na <- 30000
+nb <- 20000
+nt <- 10
+
+## Fit model
+
+assign(paste(i, "ipm_fit", sep = "_"), 
+       jags(data = jags_dat, inits = inits, parameters.to.save = parameters, 
+            model.file = "ipm1.txt", n.chains = nc, n.iter = ni, n.adapt = na,
+            n.burnin = nb, n.thin = nt, parallel = TRUE)
+       )
 
 ## Fit model
 oven_ipm_fit_newdat <- jags(data = jags_dat, inits = inits, parameters.to.save = parameters, 
