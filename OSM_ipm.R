@@ -149,10 +149,27 @@ sydat$age2[sydat$year == sydat$first] <- sydat$age.init[sydat$year == sydat$firs
 sydat$age2[sydat$age.init == 1 & sydat$year != sydat$first] <- 0
 sydat$age2[is.na(sydat$age.init) & sydat$year != sydat$first] <- 0
 
-
 ch <- subset(ch, first < 13) # first encounter on last occasion does not inform CJS model
 
-sink("ipm1.txt")
+
+# data locations
+data_locs <- counts_wide %>% 
+  subset(select = c(sensor, project_id, location_id, lat, lon)) %>% 
+  unique()
+data_locs$type <- factor(NA, levels = c("ARU", "PC", "PC+Banding"))
+data_locs$type[data_locs$sensor %in% "ARU"] <- "ARU"
+data_locs$type[data_locs$sensor %in% "PC"] <- "PC"
+data_locs$type[data_locs$location_id %in% unique(ch$STA)] <- "PC+Banding"
+
+write.csv(data_locs, "data/data_locs.csv", row.names = FALSE)
+locs_sf <- st_as_sf(data_locs, coords = c("lon", "lat"), crs = st_crs("+proj=longlat +datum=WGS84"))
+
+#Write it as kml file
+st_write(locs_sf, "locs.kml", layer="zinc", driver="KML") 
+
+
+
+sink("ipm.txt")
 cat("
 model{
 # Priors------------------------------------------------------------------------
@@ -304,15 +321,25 @@ for (i in 1:nind){
     logit(phi[i,t]) <- lphi0 + phiyr[t]
   }
     
-  for (t in (first[i]+1):nyears){
+    ## State process
+  for (t in (first[i]+1):nocc){
     # State process
-    mu2[i,t] <- z[i,t-1]*phi[i,t-1]*R[i]
+    mu2[i,t] <- z[i,t-1]*phi[i,t-1]
     z[i,t] ~ dbern(mu2[i,t])
     # Observation process
     mu1[i,t] <- p[i]*z[i,t]
     y[i,t] ~ dbern(mu1[i,t])
+    pred_y[i,t] <- mu1[i,t]
+    cjs.fit_it[i, t] <- (sqrt(y[i, t]) - sqrt(pred_y[i, t]))^2 
+    y.rep[i,t] ~ dbern(mu1[i,t])
+    cjs.rep.fit_it[i,t] <- (sqrt(y.rep[i,t]) - sqrt(pred_y[i,t]))^2 
   } # end t
+    cjs.fit_i[i] <- sum(cjs.fit_it[i,(first[i]+1):nocc])          
+    cjs.rep.fit_i[i] <- sum(cjs.rep.fit_it[i,(first[i]+1):nocc])
 } # end i
+    cjs.fit <- sum(cjs.fit_i[])           # test statistic for data
+    cjs.rep.fit <- sum(cjs.rep.fit_i[])   # test statistic for new predicted data
+    cjs.bpvalue <- step(cjs.rep.fit - cjs.fit)   # Test whether new data set more extreme
 
 ################################################################################
 # Age structure model based on MAPS SY/ASY data
@@ -327,13 +354,20 @@ for (i in 1:nsta){
 for (i in 1:M){
   age[i] ~ dbern(psi[i])
   logit(psi[i]) <- logit(nrecr[year[i]]/ntot[year[i]]) + sta.psi[station[i]]
+  age.rep[i] ~ dbern(psi[i])
+  pred.psi[i] <- psi[i]
+  age.fit_i[i] <- (sqrt(age[i]) - sqrt(pred.psi[i]))^2 
+  age.rep.fit_i[i] <- (sqrt(age.rep[i]) - sqrt(pred.psi[i]))^2 
 }
+age.fit <- sum(age.fit_i[])
+age.rep.fit <- sum(age.rep.fit_i[])
+age.bpvalue <- step(age.fit - age.rep.fit)
 }
         ",fill = TRUE)
 sink()
 
-# i = "OVEN"
-i = "SWTH"
+i = "OVEN"
+#i = "SWTH"
 CH <- ch[ch$SPEC %in% i,]
 COUNTS <- counts_wide[counts_wide$species_code %in% i,]
 SYDAT <- sydat[sydat$SPEC %in% i,]
@@ -380,21 +414,28 @@ dur <- (COUNTS$dur.num - mean(COUNTS$dur.num))/sd(COUNTS$dur.num)
 COUNTS$N.st <- apply(C, 1, max, na.rm=T)*3
 nrecr.st <- nsurv.st <- nimm.st <- aggregate(N.st ~ year, COUNTS, mean)$N.st/3
 
-jags_dat <- list(C = C, ncts = ncts, nrep = 4, YR = YR, nyears = nyears, r = r, y = y, sta = sta, nsta = nsta, hab = hab, meth = meth, dur=dur,
-                 nmeths = nmeths, nind=nind, first = first, M = M, age = age, station = station, year = year, loc_id = loc_id, nlocs = nlocs)
+jags_dat <- list(C = C, ncts = ncts, nrep = 4, YR = YR, nyears = nyears, r = r, 
+                 y = y, sta = sta, nsta = nsta, hab = hab, meth = meth, dur=dur,
+                 nmeths = nmeths, nind=nind, first = first, M = M, age = age, 
+                 station = station, year = year, loc_id = loc_id, nlocs = nlocs)
 
-inits <- function(){list(nrecr = nrecr.st, nsurv = nsurv.st, nimm = nimm.st, N = COUNTS$N.st, b1 = rnorm(1), a1 = rnorm(1),
-                         sigma.rhosta = runif(1), sigma.psta = runif(1), nsurv1=nsurv.st[1], nrecr1=nrecr.st[1],
-                         nimm1=nimm.st[1], sigma.phiyr = runif(1), sigma.piyr = runif(1), p0 = runif(1, .2, .5), 
-                         rho0 = runif(1, 0.1, 0.5), phi0 = runif(1, 0.1, 0.5), pi0 = runif(1, 0.2, 0.8), R = Rst, 
-                         z = Zst, sigma.yr = runif(1), sigma.psista = runif(1), sigma.e = 1, pct0 = runif(nmeths, .4, .7),
+inits <- function(){list(nrecr = nrecr.st, nsurv = nsurv.st, nimm = nimm.st, 
+                         N = COUNTS$N.st, b1 = rnorm(1), a1 = rnorm(1),
+                         sigma.rhosta = runif(1), sigma.psta = runif(1), nsurv1=nsurv.st[1], 
+                         nrecr1=nrecr.st[1], nimm1=nimm.st[1], sigma.phiyr = runif(1), 
+                         sigma.piyr = runif(1), p0 = runif(1, .2, .5), 
+                         rho0 = runif(1, 0.1, 0.5), phi0 = runif(1, 0.1, 0.5), 
+                         pi0 = runif(1, 0.2, 0.8), R = Rst, 
+                         z = Zst, sigma.yr = runif(1), sigma.psista = runif(1), 
+                         sigma.e = 1, pct0 = runif(nmeths, .4, .7),
                          lgamma0 = rnorm(1), mu.omega = runif(1, .2, 2), 
                          sigma.gamyr = runif(1), sigma.omega = runif(1))}
 
-parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "TFD.fit", "a1", "b1",
-                "TFD.fit.rep", "bpvalue1", "bpvalue2", "phi.hat", "phi0", "pi0", 
-                "p0", "gamma", "omega", "mu.omega", "omegayr", "pct0", "sigma.gamyr", 
-                "sigma.proj", "sigma.el", "sigma.e","sigma.phiyr", "sigma.omegayr")
+parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "TFD.fit", "a1", 
+                "b1","TFD.fit.rep", "bpvalue1", "bpvalue2", "cjs.bpvalue", "age.bpvalue", 
+                "phi.hat", "phi0", "pi0", "p0", "gamma", "omega", "mu.omega", "omegayr", 
+                "pct0", "sigma.gamyr", "sigma.proj", "sigma.el", "sigma.e","sigma.phiyr", 
+                "sigma.omegayr")
 
 # 
 ## MCMC settings
@@ -405,26 +446,22 @@ nb <- 20000
 nt <- 10
 
 ## Fit model
-
 assign(paste(i, "ipm_fit", sep = "_"), 
        jags(data = jags_dat, inits = inits, parameters.to.save = parameters, 
             model.file = "ipm1.txt", n.chains = nc, n.iter = ni, n.adapt = na,
-            n.burnin = nb, n.thin = nt, parallel = TRUE)
-       )
+            n.burnin = nb, n.thin = nt, parallel = TRUE))
 
-## Fit model
-oven_ipm_fit_newdat <- jags(data = jags_dat, inits = inits, parameters.to.save = parameters, 
-                      model.file = "ipm_zip.txt", n.chains = nc, n.iter = ni, n.adapt = na,
-                      n.burnin = nb, n.thin = nt, parallel = TRUE)
-
-ntot <- oven_ipm_fit_newdat$sims.list$nrecr + oven_ipm_fit_newdat$sims.list$nsurv + 
-  oven_ipm_fit_newdat$sims.list$nimm
+# calculate annual N estimates
+ntot <- get(paste(i, "ipm_fit", sep = "_"))$nrecr + 
+  get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv + 
+  get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm
 
 ntot.med <- apply(ntot, 2, median)
 ntot.li <- apply(ntot, 2, quantile, probs = 0.05)
 ntot.ui <- apply(ntot, 2, quantile, probs = 0.95)
 
-png("Report_figs/oven_N_newdat.png", width = 5, height = 3, units = "in", res = 600)
+# plot abundance over time
+png(paste("figs/", i, "_N.png", sep = ""), width = 5, height = 3, units = "in", res = 600)
 par(mar = c(2,4.5,1,1))
 plot(x = seq(2011, 2023, 1), y= ntot.med, type = "n", las = 1, ylim = c(0, 1.2*max(ntot.ui)), 
      ylab = expression(paste(N[t]^"tot", " (birds/point)", sep = "")), xlab = "", axes=FALSE)
@@ -435,42 +472,25 @@ polygon(x = c(seq(2011, 2023, 1), rev(seq(2011, 2023, 1))),
 points(x = seq(2011, 2023, 1), y = ntot.med, type = "l", lwd=2)
 dev.off()
 
+# estimate trend
 Trend <- 100*((ntot[,13]/ntot[,1])^(1/12)-1)
 median(Trend)
 quantile(Trend, probs = c(0.05, 0.95))
 
-Trend10 <- 100*((ntot[,10]/ntot[,1])^(1/9)-1)
-median(Trend10)
-quantile(Trend10, probs = c(0.05, 0.95))
+# detection probability
+pct.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$pct0, 2, median)
+pct.li <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$pct0, 2, quantile, probs = 0.05)
+pct.ui <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$pct0, 2, quantile, probs = 0.95)
 
-oven_data_locs <- oven_counts_wide %>% 
-  subset(select = c(sensor, project_id, location_id, lat, lon)) %>% 
-  unique()
-oven_data_locs$type <- factor(NA, levels = c("ARU", "PC", "PC+Banding"))
-oven_data_locs$type[oven_data_locs$sensor %in% "ARU"] <- "ARU"
-oven_data_locs$type[oven_data_locs$sensor %in% "PC"] <- "PC"
-oven_data_locs$type[oven_data_locs$location_id %in% unique(ch$STATION)] <- "PC+Banding"
-
-write.csv(oven_data_locs, "data/oven_data_locs.csv", row.names = FALSE)
-oven_locs_sf <- st_as_sf(oven_data_locs, coords = c("lon", "lat"), crs = st_crs("+proj=longlat +datum=WGS84"))
-
-#Write it as kml file
-st_write(oven_locs_sf, "oven_locs.kml", layer="zinc", driver="KML") 
-
-pct.med <- apply(oven_ipm_fit1$sims.list$pct0, 2, median)
-pct.li <- apply(oven_ipm_fit1$sims.list$pct0, 2, quantile, probs = 0.05)
-pct.ui <- apply(oven_ipm_fit1$sims.list$pct0, 2, quantile, probs = 0.95)
-
-
-png("Report_figs/detec.png", height = 4, width = 6.5, res = 600, units = "in")
+png(paste("figs/", i, "_detec.png", sep = ""), height = 4, width = 6.5, res = 600, units = "in")
 par(mar = c(4,4,1,1))
-plotCI(y = pct.med[c(2,3,1,4)], x = c(1, 2, 3, 4), li = pct.li[c(2,3,1,4)], ui = pct.ui[c(2,3,1,4)], 
-       xlim = c(0.5, 4.5), ylim = c(0, 1), axes = FALSE,
+plotCI(y = pct.med, x = c(1, 2, 3), li = pct.li, ui = pct.ui, 
+       xlim = c(0.5, 3.5), ylim = c(0, 1), axes = FALSE,
        ylab = "Detection probability", xlab = "", pch = 16, cex = 1)
-axis(1, at = c(1, 2, 3, 4), labels = FALSE)
-text(x = 1:4,
+axis(1, at = c(1, 2, 3), labels = FALSE)
+text(x = 1:3,
      y = par("usr")[3]-.05,
-     labels = c("1SPM-3min", "1SPT-3min", "1SPM-10min", "PC-10min"),
+     labels = c("1SPM", "1SPT", "PC"),
      xpd = NA,
      ## Rotate the labels by 35 degrees.
      srt = 35,
@@ -483,48 +503,86 @@ box()
 dev.off()
 
 # mean demographic rates
+quantile(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phi.mn, probs = c(0.05, 0.5, 0.95))
+quantile(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega.mn, probs = c(0.05, 0.5, 0.95))
+quantile(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma.mn, probs = c(0.05, 0.5, 0.95))
 
-quantile(oven_ipm_fit1$sims.list$phi.mn, probs = c(0.05, 0.5, 0.95))
-quantile(oven_ipm_fit1$sims.list$omega.mn, probs = c(0.05, 0.5, 0.95))
-quantile(oven_ipm_fit1$sims.list$gamma.mn, probs = c(0.05, 0.5, 0.95))
+# annual demographic rate estimates
+phi.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phit, 2, median)
+phi.li <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phit, 2, quantile, probs = 0.05)
+phi.ui <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phit, 2, quantile, probs = 0.95)
 
-phi.med <- apply(oven_ipm_fit1$sims.list$phit, 2, median)
-phi.li <- apply(oven_ipm_fit1$sims.list$phit, 2, quantile, probs = 0.05)
-phi.ui <- apply(oven_ipm_fit1$sims.list$phit, 2, quantile, probs = 0.95)
+gam.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma, 2, median)
+gam.li <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma, 2, quantile, probs = 0.05)
+gam.ui <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma, 2, quantile, probs = 0.95)
 
-gam.med <- apply(oven_ipm_fit1$sims.list$gamma, 2, median)
-gam.li <- apply(oven_ipm_fit1$sims.list$gamma, 2, quantile, probs = 0.05)
-gam.ui <- apply(oven_ipm_fit1$sims.list$gamma, 2, quantile, probs = 0.95)
+omega.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega, 2, median)
+omega.li <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega, 2, quantile, probs = 0.05)
+omega.ui <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega, 2, quantile, probs = 0.95)
 
-omega.med <- apply(oven_ipm_fit1$sims.list$omega, 2, median)
-omega.li <- apply(oven_ipm_fit1$sims.list$omega, 2, quantile, probs = 0.05)
-omega.ui <- apply(oven_ipm_fit1$sims.list$omega, 2, quantile, probs = 0.95)
-
+# realized population growth
 lam.med <- apply(ntot[,2:13]/ntot[,1:12], 2, median)
 lam.li <- apply(ntot[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
 lam.ui <- apply(ntot[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
 
+# plot pop'n growth and demographic rates
+png(paste("figs/", i, "_demographic_rates.png", sep = ""), width = 5, height = 3, units = "in", res = 600)
+par(mar = c(2,4.5,1,1), mfrow = c(2,2))
+
+plot(x = seq(2011, 2022, 1), y= lam.med, type = "n", las = 1, ylim = c(0, 1.2*max(lam.ui)), 
+     ylab = expression(paste("Population growth (", lambda[t], ")", sep = "")), xlab = "", axes=FALSE)
+axis(1)
+axis(2, las=1)
+polygon(x = c(seq(2011, 2022, 1), rev(seq(2011, 2022, 1))), 
+        y =c(lam.li, rev(lam.ui)), border = NA, col = add.alpha("gray70", alpha=.5))
+points(x = seq(2011, 2022, 1), y = lam.med, type = "l", lwd=2)
+
+plot(x = seq(2011, 2022, 1), y= phi.med, type = "n", las = 1, ylim = c(0, 1.2*max(phi.ui)), 
+     ylab = expression(paste("Survival probability (", phi[t], ")", sep = "")), xlab = "", axes=FALSE)
+axis(1)
+axis(2, las=1)
+polygon(x = c(seq(2011, 2022, 1), rev(seq(2011, 2022, 1))), 
+        y =c(phi.li, rev(phi.ui)), border = NA, col = add.alpha("gray70", alpha=.5))
+points(x = seq(2011, 2022, 1), y = phi.med, type = "l", lwd=2)
+
+plot(x = seq(2011, 2022, 1), y= gam.med, type = "n", las = 1, ylim = c(0, 1.2*max(gam.ui)), 
+     ylab = expression(paste("Recruitment rate (", gamma[t], ")", sep = "")), xlab = "", axes=FALSE)
+axis(1)
+axis(2, las=1)
+polygon(x = c(seq(2011, 2022, 1), rev(seq(2011, 2022, 1))), 
+        y =c(gam.li, rev(gam.ui)), border = NA, col = add.alpha("gray70", alpha=.5))
+points(x = seq(2011, 2022, 1), y = gam.med, type = "l", lwd=2)
+
+plot(x = seq(2011, 2022, 1), y= omega.med, type = "n", las = 1, ylim = c(0, 1.2*max(omega.ui)), 
+     ylab = expression(paste("Immigration rate (", omega[t], ")", sep = "")), xlab = "", axes=FALSE)
+axis(1)
+axis(2, las=1)
+polygon(x = c(seq(2011, 2022, 1), rev(seq(2011, 2022, 1))), 
+        y =c(omega.li, rev(omega.ui)), border = NA, col = add.alpha("gray70", alpha=.5))
+points(x = seq(2011, 2022, 1), y = omega.med, type = "l", lwd=2)
+
+dev.off()
+
 # ### realized demographic rates
-# phi.real.med <- apply(oven_ipm_fit1$sims.list$nsurv[,2:13]/ntot[,1:12], 2, median)
-# phi.real.05 <- apply(oven_ipm_fit1$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
-# phi.real.25 <- apply(oven_ipm_fit1$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
-# phi.real.75 <- apply(oven_ipm_fit1$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
-# phi.real.95 <- apply(oven_ipm_fit1$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
+# phi.real.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv[,2:13]/ntot[,1:12], 2, median)
+# phi.real.05 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
+# phi.real.25 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
+# phi.real.75 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
+# phi.real.95 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nsurv[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
 # 
-# gam.real.med <- apply(oven_ipm_fit1$sims.list$nrecr[,2:13]/ntot[,1:12], 2, median)
-# gam.real.05 <- apply(oven_ipm_fit1$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
-# gam.real.25 <- apply(oven_ipm_fit1$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
-# gam.real.75 <- apply(oven_ipm_fit1$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
-# gam.real.95 <- apply(oven_ipm_fit1$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
+# gam.real.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nrecr[,2:13]/ntot[,1:12], 2, median)
+# gam.real.05 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
+# gam.real.25 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
+# gam.real.75 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
+# gam.real.95 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nrecr[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
 # 
-# omega.real.med <- apply(oven_ipm_fit1$sims.list$nimm[,2:13]/ntot[,1:12], 2, median)
-# omega.real.05 <- apply(oven_ipm_fit1$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
-# omega.real.25 <- apply(oven_ipm_fit1$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
-# omega.real.75 <- apply(oven_ipm_fit1$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
-# omega.real.95 <- apply(oven_ipm_fit1$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
+# omega.real.med <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm[,2:13]/ntot[,1:12], 2, median)
+# omega.real.05 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.05)
+# omega.real.25 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.25)
+# omega.real.75 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.75)
+# omega.real.95 <- apply(get(paste(i, "ipm_fit", sep = "_"))$sims.list$nimm[,2:13]/ntot[,1:12], 2, quantile, probs = 0.95)
 # 
-# 
-# png("Report_figs/dem-realized.png", width = 6.5, height = 5, units = "in", res = 600)
+# png(paste("figs/", i, "_dem-realized.png", sep=""), width = 6.5, height = 5, units = "in", res = 600)
 # par(mar = c(2,4.5,1,1), mfrow = c(2,2))
 # 
 # par(mar = c(2,4.5,1,1))
@@ -674,9 +732,9 @@ dev.off()
 
 
 # vital rate correlations
-phi.lam.cor <- rep(NA, dim(oven_ipm_fit1$sims.list$phit)[1])
+phi.lam.cor <- rep(NA, dim(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phit)[1])
 for (i in 1:length(phi.lam.cor)){
-  phi.lam.cor[i] <- cor.test(oven_ipm_fit1$sims.list$phit[i,], 
+  phi.lam.cor[i] <- cor.test(get(paste(i, "ipm_fit", sep = "_"))$sims.list$phit[i,], 
                              ntot[i,2:13]/ntot[i,1:12])$estimate
 }
 
@@ -687,9 +745,9 @@ length(phi.lam.cor[phi.lam.cor > 0])/length(phi.lam.cor)
 
 
 # vital rate correlations
-imm.lam.cor <- rep(NA, dim(oven_ipm_fit1$sims.list$omega)[1])
+imm.lam.cor <- rep(NA, dim(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega)[1])
 for (i in 1:length(imm.lam.cor)){
-  imm.lam.cor[i] <- cor.test(oven_ipm_fit1$sims.list$omega[i,], 
+  imm.lam.cor[i] <- cor.test(get(paste(i, "ipm_fit", sep = "_"))$sims.list$omega[i,], 
                              ntot[i,2:13]/ntot[i,1:12])$estimate
 }
 
@@ -712,9 +770,9 @@ dev.off()
 
 
 # vital rate correlations
-gam.lam.cor <- rep(NA, dim(oven_ipm_fit1$sims.list$gamma)[1])
+gam.lam.cor <- rep(NA, dim(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma)[1])
 for (i in 1:length(gam.lam.cor)){
-  gam.lam.cor[i] <- cor.test(oven_ipm_fit1$sims.list$gamma[i,], 
+  gam.lam.cor[i] <- cor.test(get(paste(i, "ipm_fit", sep = "_"))$sims.list$gamma[i,], 
                              ntot[i,2:13]/ntot[i,1:12])$estimate
 }
 
