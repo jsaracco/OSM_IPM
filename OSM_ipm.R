@@ -431,11 +431,10 @@ inits <- function(){list(nrecr = nrecr.st, nsurv = nsurv.st, nimm = nimm.st,
                          lgamma0 = rnorm(1), mu.omega = runif(1, .2, 2), 
                          sigma.gamyr = runif(1), sigma.omega = runif(1))}
 
-parameters <- c("nrecr", "nsurv", "nimm", "chi2.fit", "chi2.fit.rep", "TFD.fit", "a1", 
-                "b1","TFD.fit.rep", "bpvalue1", "bpvalue2", "cjs.bpvalue", "age.bpvalue", 
-                "phi.hat", "phi0", "pi0", "p0", "gamma", "omega", "mu.omega", "omegayr", 
-                "pct0", "sigma.gamyr", "sigma.proj", "sigma.el", "sigma.e","sigma.phiyr", 
-                "sigma.omegayr")
+parameters <- c("nrecr", "nsurv", "nimm", "a1", "b1", "bpvalue1", "bpvalue2", "cjs.bpvalue", 
+                "age.bpvalue", "phi.hat", "phi0", "pi0", "p0", "gamma", "omega", "mu.omega", 
+                "omegayr", "pct0", "sigma.gamyr", "sigma.proj", "sigma.el", "sigma.e",
+                "sigma.phiyr", "sigma.omegayr")
 
 # 
 ## MCMC settings
